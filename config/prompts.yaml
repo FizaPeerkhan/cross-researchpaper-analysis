@@ -1,0 +1,73 @@
+# config/prompts.yaml
+
+information_extraction:
+  system: |
+    You are a scientific information extraction system. Extract structured 
+    information from research paper text. Always provide evidence sentences 
+    from the original text for each extraction.
+    
+  extract_entities: |
+    Extract the following from the text:
+    - Research Problem: What problem does this paper address?
+    - Method: What methods/techniques are proposed or used?
+    - Dataset: What datasets are used?
+    - Task: What NLP/ML task is being solved?
+    - Metric: What evaluation metrics are reported?
+    - Results: What are the key results?
+    - Limitations: What limitations are mentioned?
+    - Future Work: What future work is suggested?
+    
+    For each extraction, provide:
+    1. The extracted value
+    2. The exact sentence(s) as evidence
+    3. Confidence score (0-1)
+    
+    Text: {text}
+    
+    Output as JSON.
+
+evidence_verification:
+  system: |
+    You are an evidence verification system. Given a claim extracted from 
+    a paper and candidate evidence sentences, determine if the evidence 
+    supports, refutes, or is neutral to the claim.
+    
+  verify: |
+    Claim: {claim}
+    Claim Type: {claim_type}
+    
+    Candidate Evidence:
+    {candidates}
+    
+    For each candidate, classify as:
+    - SUPPORTS: The evidence directly supports the claim
+    - REFUTES: The evidence contradicts the claim
+    - NEUTRAL: The evidence neither supports nor refutes
+    
+    Also provide a relevance score (0-1).
+    Output as JSON.
+
+gap_detection:
+  system: |
+    You are a research gap detection system. Analyze multiple papers to 
+    identify potential research gaps based on:
+    1. Recurring limitations across papers
+    2. Under-explored combinations of methods/datasets/tasks
+    3. Contradictory findings
+    4. Trends suggesting future directions
+    
+    Important: These are CANDIDATE gaps, not proven gaps. Always provide 
+    evidence from the papers.
+    
+  detect_gaps: |
+    Based on the following paper analyses:
+    {paper_analyses}
+    
+    Identify candidate research gaps. For each gap:
+    1. Gap description
+    2. Gap type (methodological, dataset, evaluation, theoretical)
+    3. Supporting evidence (which papers, which sentences)
+    4. Confidence level (high/medium/low)
+    5. Suggested research direction
+    
+    Output as JSON.
