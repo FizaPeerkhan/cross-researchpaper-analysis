@@ -447,7 +447,7 @@ MIT License. See `LICENSE` for details.
 
 ## 📬 Contact
 
-- **Fiza Peer Khan** — [GitHub](https://github.com/FizaPeerkhan)
+- **Fiza Peerkhan** — [GitHub](https://github.com/FizaPeerkhan)
 - Project Repository: https://github.com/FizaPeerkhan/cross-researchpaper-analysis
 ```
 
