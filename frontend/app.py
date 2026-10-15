@@ -1,396 +1,655 @@
-# frontend/app.py
+"""SciInsight Streamlit frontend.
 
-import streamlit as st
-import requests
-import json
+The backend contract is intentionally unchanged:
+- GET  /
+- GET  /papers -> {"papers": [...]}
+- POST /upload with multipart field "file" -> {"paper_id": ...}
+- POST /extract/{paper_id}
+- GET  /extract/{paper_id} -> existing extraction JSON
+- POST /compare with a JSON list of paper IDs
+- POST /gaps with a JSON list of paper IDs
+- GET  /evidence with query parameters
+"""
+
+import os
 from datetime import datetime
 
-API_URL = "http://localhost:8000"
+import requests
+import streamlit as st
+
+API_URL = os.getenv("SCINSIGHT_API_URL", "http://localhost:8000").rstrip("/")
+REQUEST_TIMEOUT = (5, 120)
+
+PAGES = [
+    "📤 Upload Papers",
+    "📄 Paper Explorer",
+    "📊 Cross-Paper Analysis",
+    "🔍 Research Gaps",
+    "🔎 Evidence Viewer",
+]
 
 st.set_page_config(
-    page_title="Scientific Literature Intelligence",
+    page_title="SciInsight | Scientific Literature Intelligence",
     page_icon="🔬",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# Custom CSS
-st.markdown("""
-<style>
-    .main-header {
-        font-size: 2.5rem;
-        font-weight: bold;
-        color: #1f77b4;
+# ---------- Styling: presentation only; does not alter API payloads ----------
+st.markdown(
+    """
+    <style>
+    :root {
+        --si-ink: #172033;
+        --si-muted: #64748b;
+        --si-blue: #3157d5;
+        --si-border: #e5eaf2;
+        --si-panel: #f7f9fc;
     }
-    .paper-card {
-        background-color: #f0f2f6;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        margin-bottom: 1rem;
+    .block-container { padding-top: 1.7rem; padding-bottom: 3rem; max-width: 1440px; }
+    [data-testid="stSidebar"] { border-right: 1px solid var(--si-border); }
+    .si-eyebrow {
+        color: #3157d5; font-size: .78rem; font-weight: 750;
+        letter-spacing: .13em; text-transform: uppercase; margin-bottom: .35rem;
     }
-    .gap-card {
-        background-color: #fff3e0;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        border-left: 4px solid #ff9800;
-        margin-bottom: 1rem;
+    .si-title { color: var(--si-ink); font-size: 2.15rem; font-weight: 800; line-height: 1.15; }
+    .si-subtitle { color: var(--si-muted); font-size: 1rem; margin-top: .55rem; }
+    .si-panel {
+        background: var(--si-panel); border: 1px solid var(--si-border);
+        border-radius: 14px; padding: 1rem 1.15rem; margin: .35rem 0 .8rem 0;
     }
-    .evidence-box {
-        background-color: #e8f5e9;
-        padding: 0.75rem;
-        border-radius: 0.25rem;
-        border-left: 3px solid #4caf50;
-        margin: 0.5rem 0;
-        font-style: italic;
+    .si-evidence {
+        background: #f0f8f4; border-left: 4px solid #23865b;
+        border-radius: 0 10px 10px 0; padding: .85rem 1rem;
+        margin: .45rem 0 .8rem 0; color: #173d2d;
     }
-</style>
-""", unsafe_allow_html=True)
+    .si-muted { color: var(--si-muted); font-size: .88rem; }
+    div[data-testid="stMetric"] {
+        background: var(--si-panel); border: 1px solid var(--si-border);
+        padding: .9rem 1rem; border-radius: 12px;
+    }
+    div.stButton > button { border-radius: 9px; font-weight: 650; }
+    div[data-testid="stFileUploader"] {
+        border: 1px dashed #b8c5df; border-radius: 12px; padding: .5rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-st.title("🔬 Scientific Literature Intelligence")
-st.markdown("""
-**Evidence-Grounded Information Extraction and Cross-Paper Research Gap Analysis**
 
-Upload research papers, extract structured information, compare across papers, and identify candidate research gaps.
-""")
-
-# Sidebar
-with st.sidebar:
-    st.header("Navigation")
-    page = st.radio(
-        "Go to",
-        ["📤 Upload Papers", "📄 Paper Explorer", "📊 Cross-Paper Analysis", "🔍 Research Gaps", "🔎 Evidence Viewer"],
-    )
-    
-    st.divider()
-    st.header("System Status")
+# ---------- API helpers ----------
+def api_request(method, path, *, params=None, json_body=None, files=None):
+    """Call the existing API and return (response, error_message)."""
     try:
-        resp = requests.get(f"{API_URL}/")
-        if resp.status_code == 200:
-            st.success("API Connected")
+        response = requests.request(
+            method=method,
+            url=f"{API_URL}{path}",
+            params=params,
+            json=json_body,
+            files=files,
+            timeout=REQUEST_TIMEOUT,
+        )
+        if not response.ok:
+            detail = response.text.strip()
+            try:
+                body = response.json()
+                detail = body.get("detail", detail) if isinstance(body, dict) else detail
+            except ValueError:
+                pass
+            return response, f"API returned {response.status_code}: {detail or response.reason}"
+        return response, None
+    except requests.exceptions.Timeout:
+        return None, "The API request timed out. Large PDFs can take longer; please retry."
+    except requests.exceptions.ConnectionError:
+        return None, f"Cannot connect to the backend at {API_URL}. Start the API and retry."
+    except requests.exceptions.RequestException as exc:
+        return None, f"Request failed: {exc}"
+
+
+def api_json(method, path, *, params=None, json_body=None, files=None):
+    response, error = api_request(
+        method, path, params=params, json_body=json_body, files=files
+    )
+    if error:
+        return None, error
+    try:
+        return response.json(), None
+    except ValueError:
+        return None, "The API response was not valid JSON."
+
+
+def fetch_papers():
+    data, error = api_json("GET", "/papers")
+    if error:
+        return [], error
+    if not isinstance(data, dict) or not isinstance(data.get("papers"), list):
+        return [], "The /papers response did not contain the expected 'papers' list."
+    return data["papers"], None
+
+
+def paper_label(paper):
+    return paper.get("title") or paper.get("filename") or str(paper.get("paper_id", "Unknown paper"))
+
+
+def show_evidence(evidence, page_key="page_number"):
+    """Render evidence without changing its source fields."""
+    text = evidence.get("text", "")
+    if text:
+        st.markdown(f"> {text}")
+    page = evidence.get(page_key, evidence.get("page", "?"))
+    section = evidence.get("section")
+    details = []
+    if page not in (None, ""):
+        details.append(f"Page {page}")
+    if section:
+        details.append(f"Section: {section}")
+    if details:
+        st.caption(" · ".join(details))
+
+
+def render_item_list(items, *, title=None, show_evidence_items=False):
+    if title:
+        st.markdown(f"#### {title}")
+    if not items:
+        st.caption("No information extracted for this section.")
+        return
+    for index, item in enumerate(items, start=1):
+        if isinstance(item, dict):
+            value = item.get("value", item.get("text", str(item)))
+            evidence = item.get("evidence", [])
+            confidence = item.get("confidence")
         else:
-            st.error("API Error")
-    except:
-        st.error("API Offline")
+            value, evidence, confidence = str(item), [], None
+
+        with st.container(border=True):
+            st.write(value)
+            if confidence is not None:
+                try:
+                    st.caption(f"Confidence: {float(confidence):.2f}")
+                except (TypeError, ValueError):
+                    st.caption(f"Confidence: {confidence}")
+            if evidence and show_evidence_items:
+                with st.expander(f"View evidence ({len(evidence)})"):
+                    for ev in evidence:
+                        show_evidence(ev)
 
 
-# ============ PAGE: UPLOAD PAPERS ============
+def render_empty_state(title, message, icon="📚"):
+    with st.container(border=True):
+        st.markdown(f"### {icon} {title}")
+        st.write(message)
+
+
+def render_page_header(eyebrow, title, description):
+    st.markdown(f'<div class="si-eyebrow">{eyebrow}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="si-title">{title}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="si-subtitle">{description}</div>', unsafe_allow_html=True)
+    st.write("")
+
+
+# ---------- Sidebar ----------
+with st.sidebar:
+    st.markdown("## 🔬 SciInsight")
+    st.caption("Scientific Literature Intelligence")
+    st.divider()
+    page = st.radio("WORKSPACE", PAGES, label_visibility="visible")
+    st.divider()
+    st.markdown("#### Backend status")
+    status_placeholder = st.empty()
+    health_response, health_error = api_request("GET", "/")
+    if health_error:
+        status_placeholder.error("Backend offline")
+        with st.expander("Connection details"):
+            st.caption(health_error)
+    else:
+        status_placeholder.success("Backend connected")
+        st.caption(API_URL)
+    st.divider()
+    st.caption("Evidence-grounded analysis · Candidate gaps, not definitive claims")
+
+
+# ---------- Upload Papers ----------
 if page == "📤 Upload Papers":
-    st.header("Upload Research Papers")
-    
+    render_page_header(
+        "WORKSPACE / INGESTION",
+        "Your literature workspace",
+        "Upload research PDFs, extract their scientific information, and track processing status.",
+    )
+
+    papers, papers_error = fetch_papers()
+    if papers_error:
+        st.error(papers_error)
+    else:
+        extracted_count = sum(bool(p.get("extracted")) for p in papers)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Papers in library", len(papers))
+        m2.metric("Successfully extracted", extracted_count)
+        m3.metric("Awaiting extraction", max(0, len(papers) - extracted_count))
+
+    st.markdown("### Add research papers")
     uploaded_files = st.file_uploader(
-        "Choose PDF files",
+        "Choose one or more PDF files",
         type=["pdf"],
         accept_multiple_files=True,
+        help="Select text-based research PDFs. Scanned PDFs may need OCR support in the backend.",
+        key="paper_uploader",
     )
-    
+
     if uploaded_files:
-        for uploaded_file in uploaded_files:
-            with st.spinner(f"Uploading {uploaded_file.name}..."):
-                files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")}
-                resp = requests.post(f"{API_URL}/upload", files=files)
-                
-                if resp.status_code == 200:
-                    result = resp.json()
-                    st.success(f"✅ Uploaded: {uploaded_file.name} (ID: {result['paper_id']})")
-                    
-                    # Auto-extract
-                    with st.spinner(f"Extracting information..."):
-                        extract_resp = requests.post(f"{API_URL}/extract/{result['paper_id']}")
-                        if extract_resp.status_code == 200:
-                            st.info(f"✅ Extracted information from {uploaded_file.name}")
-                        else:
-                            st.warning(f"⚠️ Extraction failed for {uploaded_file.name}")
+        total_bytes = sum(file.size for file in uploaded_files)
+        c1, c2 = st.columns(2)
+        c1.info(f"{len(uploaded_files)} PDF(s) selected")
+        c2.caption(f"Total size: {total_bytes / (1024 * 1024):.2f} MB")
+        with st.expander("Review selected files"):
+            for file in uploaded_files:
+                st.write(f"📄 {file.name} · {file.size / 1024:.1f} KB")
+
+        if st.button("Upload and extract selected papers", type="primary", use_container_width=True):
+            progress = st.progress(0, text="Preparing uploads...")
+            successes, failures = 0, []
+            for index, uploaded_file in enumerate(uploaded_files):
+                progress.progress(
+                    int(index / len(uploaded_files) * 100),
+                    text=f"Uploading {uploaded_file.name}...",
+                )
+                payload = {
+                    "file": (
+                        uploaded_file.name,
+                        uploaded_file.getvalue(),
+                        "application/pdf",
+                    )
+                }
+                result, error = api_json("POST", "/upload", files=payload)
+                if error:
+                    failures.append(f"{uploaded_file.name}: {error}")
+                    continue
+
+                paper_id = result.get("paper_id") if isinstance(result, dict) else None
+                if paper_id is None:
+                    failures.append(f"{uploaded_file.name}: upload response did not contain paper_id.")
+                    continue
+
+                _, extract_error = api_request("POST", f"/extract/{paper_id}")
+                if extract_error:
+                    failures.append(f"{uploaded_file.name}: uploaded (ID {paper_id}) but extraction failed: {extract_error}")
                 else:
-                    st.error(f"❌ Failed to upload {uploaded_file.name}")
-    
+                    successes += 1
+
+            progress.progress(100, text="Upload batch complete.")
+            if successes:
+                st.success(f"Successfully uploaded and extracted {successes} paper(s).")
+            if failures:
+                with st.expander(f"{len(failures)} item(s) need attention", expanded=True):
+                    for failure in failures:
+                        st.warning(failure)
+            st.rerun()
+
     st.divider()
-    st.subheader("Uploaded Papers")
-    
-    resp = requests.get(f"{API_URL}/papers")
-    if resp.status_code == 200:
-        papers = resp.json()["papers"]
-        if papers:
-            for paper in papers:
-                col1, col2, col3 = st.columns([3, 1, 1])
-                with col1:
-                    st.write(f"**{paper.get('title', paper['filename'])}**")
-                    st.caption(f"ID: {paper['paper_id']} | Uploaded: {paper['uploaded_at'][:19]}")
-                with col2:
-                    if paper["extracted"]:
+    header_col, refresh_col = st.columns([5, 1])
+    with header_col:
+        st.markdown("### Paper library")
+    with refresh_col:
+        if st.button("↻ Refresh", key="refresh_uploads"):
+            st.rerun()
+
+    papers, papers_error = fetch_papers()
+    if papers_error:
+        st.error(papers_error)
+    elif not papers:
+        render_empty_state("No papers yet", "Upload your first research PDF to begin.", "📥")
+    else:
+        for paper in papers:
+            with st.container(border=True):
+                title_col, status_col, action_col = st.columns([5, 1.4, 1.4])
+                with title_col:
+                    st.markdown(f"**{paper_label(paper)}**")
+                    uploaded_at = paper.get("uploaded_at", "")
+                    if uploaded_at:
+                        st.caption(f"ID: {paper.get('paper_id', 'N/A')} · Uploaded: {str(uploaded_at)[:19]}")
+                    else:
+                        st.caption(f"Paper ID: {paper.get('paper_id', 'N/A')}")
+                with status_col:
+                    if paper.get("extracted"):
                         st.success("Extracted")
                     else:
-                        st.warning("Not extracted")
-                with col3:
-                    if not paper["extracted"]:
-                        if st.button("Extract", key=f"extract_{paper['paper_id']}"):
-                            with st.spinner("Extracting..."):
-                                requests.post(f"{API_URL}/extract/{paper['paper_id']}")
-                                st.rerun()
-        else:
-            st.info("No papers uploaded yet")
+                        st.warning("Pending")
+                with action_col:
+                    if not paper.get("extracted") and st.button(
+                        "Extract", key=f"extract_{paper.get('paper_id')}", use_container_width=True
+                    ):
+                        with st.spinner(f"Extracting {paper_label(paper)}..."):
+                            _, error = api_request("POST", f"/extract/{paper.get('paper_id')}")
+                        if error:
+                            st.error(error)
+                        else:
+                            st.success("Extraction completed.")
+                        st.rerun()
 
 
-# ============ PAGE: PAPER EXPLORER ============
+# ---------- Paper Explorer ----------
 elif page == "📄 Paper Explorer":
-    st.header("Paper Explorer")
-    
-    resp = requests.get(f"{API_URL}/papers")
-    if resp.status_code == 200:
-        papers = resp.json()["papers"]
-        extracted_papers = [p for p in papers if p["extracted"]]
-        
+    render_page_header(
+        "WORKSPACE / PAPER DETAIL",
+        "Paper explorer",
+        "Inspect extracted scientific information and open evidence behind supported fields.",
+    )
+    papers, error = fetch_papers()
+    if error:
+        st.error(error)
+    else:
+        extracted_papers = [p for p in papers if p.get("extracted")]
         if not extracted_papers:
-            st.info("No extracted papers available. Upload and extract papers first.")
+            render_empty_state(
+                "No extracted papers available",
+                "Go to Upload Papers and extract at least one paper first.",
+            )
         else:
             selected = st.selectbox(
-                "Select a paper",
+                "Choose a paper",
                 options=extracted_papers,
-                format_func=lambda p: p.get("title", p["filename"]),
+                format_func=paper_label,
+                key="explorer_selected_paper",
             )
-            
             if selected:
-                with st.spinner("Loading extraction..."):
-                    ext_resp = requests.get(f"{API_URL}/extract/{selected['paper_id']}")
-                    
-                    if ext_resp.status_code == 200:
-                        extraction = ext_resp.json()
-                        
-                        st.subheader(extraction["title"])
-                        st.caption(f"Paper ID: {extraction['paper_id']}")
-                        
-                        col1, col2 = st.columns(2)
-                        
-                        with col1:
-                            st.markdown("### 🎯 Problem")
-                            for item in extraction.get("problem", []):
-                                st.write(f"• {item['value']}")
-                            
-                            st.markdown("### 🔧 Methods")
-                            for item in extraction.get("methods", []):
-                                with st.expander(f"**{item['value']}** (confidence: {item.get('confidence', 0):.2f})"):
-                                    for ev in item.get("evidence", []):
-                                        st.markdown(f'<div class="evidence-box">"{ev["text"]}"<br><small>Page {ev["page_number"]}</small></div>', unsafe_allow_html=True)
-                            
-                            st.markdown("### 📊 Datasets")
-                            for item in extraction.get("datasets", []):
-                                st.write(f"• {item['value']}")
-                        
-                        with col2:
-                            st.markdown("### 📋 Tasks")
-                            for item in extraction.get("tasks", []):
-                                st.write(f"• {item['value']}")
-                            
-                            st.markdown("### 📈 Metrics")
-                            for item in extraction.get("metrics", []):
-                                st.write(f"• {item['value']}")
-                            
-                            st.markdown("### ⚠️ Limitations")
-                            for item in extraction.get("limitations", []):
-                                with st.expander(f"**{item['value'][:100]}...**"):
-                                    for ev in item.get("evidence", []):
-                                        st.markdown(f'<div class="evidence-box">"{ev["text"]}"<br><small>Page {ev["page_number"]}</small></div>', unsafe_allow_html=True)
-                            
-                            st.markdown("### 🔮 Future Work")
-                            for item in extraction.get("future_work", []):
-                                st.write(f"• {item['value'][:200]}")
+                extraction, error = api_json("GET", f"/extract/{selected['paper_id']}")
+                if error:
+                    st.error(error)
+                elif isinstance(extraction, dict):
+                    st.markdown(f"## {extraction.get('title') or paper_label(selected)}")
+                    st.caption(f"Paper ID: {extraction.get('paper_id', selected.get('paper_id', 'N/A'))}")
+                    sections = [
+                        ("🎯 Problem", "problem"),
+                        ("🔧 Methods", "methods"),
+                        ("📊 Datasets", "datasets"),
+                        ("📋 Tasks", "tasks"),
+                        ("📈 Metrics", "metrics"),
+                        ("⚠️ Limitations", "limitations"),
+                        ("🔮 Future work", "future_work"),
+                    ]
+                    counts = {
+                        label: len(extraction.get(key, []) or [])
+                        for label, key in sections
+                    }
+                    metric_cols = st.columns(4)
+                    for col, (label, count) in zip(metric_cols, list(counts.items())[:4]):
+                        col.metric(label, count)
+
+                    tab_labels = [label for label, _ in sections]
+                    tabs = st.tabs(tab_labels)
+                    for tab, (label, key) in zip(tabs, sections):
+                        with tab:
+                            items = extraction.get(key, []) or []
+                            if key in ("methods", "limitations"):
+                                render_item_list(items, show_evidence_items=True)
+                            else:
+                                render_item_list(items)
 
 
-# ============ PAGE: CROSS-PAPER ANALYSIS ============
+# ---------- Cross-Paper Analysis ----------
 elif page == "📊 Cross-Paper Analysis":
-    st.header("Cross-Paper Analysis")
-    
-    resp = requests.get(f"{API_URL}/papers")
-    if resp.status_code == 200:
-        papers = resp.json()["papers"]
-        extracted_papers = [p for p in papers if p["extracted"]]
-        
+    render_page_header(
+        "WORKSPACE / SYNTHESIS",
+        "Cross-paper analysis",
+        "Compare methods, datasets, limitations and trends across a selected set of extracted papers.",
+    )
+    papers, error = fetch_papers()
+    if error:
+        st.error(error)
+    else:
+        extracted_papers = [p for p in papers if p.get("extracted")]
         if len(extracted_papers) < 2:
-            st.info("Need at least 2 extracted papers for comparison.")
+            render_empty_state(
+                "More papers needed",
+                "Extract at least two papers before running cross-paper analysis.",
+            )
         else:
             selected_ids = st.multiselect(
-                "Select papers to compare",
+                "Papers to compare",
                 options=[p["paper_id"] for p in extracted_papers],
                 format_func=lambda pid: next(
-                    (p.get("title", p["filename"]) for p in extracted_papers if p["paper_id"] == pid),
-                    pid,
+                    (paper_label(p) for p in extracted_papers if p.get("paper_id") == pid),
+                    str(pid),
                 ),
                 default=[p["paper_id"] for p in extracted_papers[:5]],
+                key="compare_selected_ids",
             )
-            
-            if st.button("🔍 Analyze", type="primary") and len(selected_ids) >= 2:
-                with st.spinner("Analyzing papers..."):
-                    resp = requests.post(f"{API_URL}/compare", json=selected_ids)
-                    
-                    if resp.status_code == 200:
-                        result = resp.json()
-                        
-                        # Comparison results
-                        st.subheader("📊 Common Methods")
-                        common_methods = result["comparison"]["common_methods"]
-                        if common_methods:
-                            for method, papers in sorted(common_methods.items(), key=lambda x: -len(x[1])):
-                                st.write(f"• **{method}** — used in {len(papers)} papers")
-                        else:
-                            st.info("No common methods found")
-                        
-                        st.subheader("📊 Common Datasets")
-                        common_datasets = result["comparison"]["common_datasets"]
-                        if common_datasets:
-                            for dataset, papers in sorted(common_datasets.items(), key=lambda x: -len(x[1])):
-                                st.write(f"• **{dataset}** — used in {len(papers)} papers")
-                        else:
-                            st.info("No common datasets found")
-                        
-                        st.subheader("⚠️ Common Limitations")
-                        common_lims = result["comparison"]["common_limitations"]
-                        if common_lims:
-                            for lim_type, papers in sorted(common_lims.items(), key=lambda x: -len(x[1])):
-                                st.write(f"• **{lim_type.replace('_', ' ').title()}** — {len(papers)} papers")
-                        
-                        # Trends
-                        st.subheader("📈 Trends")
-                        trends = result.get("trends", {})
-                        
-                        if trends.get("emerging_methods"):
-                            st.markdown("**Emerging Methods:**")
-                            for m in trends["emerging_methods"][:5]:
-                                st.write(f"• {m['value']} ({m['frequency']:.0%})")
-                        
-                        # Visualizations
-                        st.subheader("📊 Visualizations")
-                        
-                        import plotly.express as px
-                        import pandas as pd
-                        
-                        # Method frequency chart
-                        method_freq = trends.get("method_frequency", {})
-                        if method_freq:
-                            df = pd.DataFrame(
-                                list(method_freq.items())[:10],
-                                columns=["Method", "Count"],
-                            )
-                            fig = px.bar(df, x="Count", y="Method", orientation="h",
-                                        title="Top Methods Across Papers")
-                            st.plotly_chart(fig, use_container_width=True)
-                        
-                        # Dataset frequency chart
-                        dataset_freq = trends.get("dataset_frequency", {})
-                        if dataset_freq:
-                            df = pd.DataFrame(
-                                list(dataset_freq.items())[:10],
-                                columns=["Dataset", "Count"],
-                            )
-                            fig = px.bar(df, x="Count", y="Dataset", orientation="h",
-                                        title="Top Datasets Across Papers")
-                            st.plotly_chart(fig, use_container_width=True)
-
-
-# ============ PAGE: RESEARCH GAPS ============
-elif page == "🔍 Research Gaps":
-    st.header("Research Gap Detection")
-    
-    st.markdown("""
-    This module identifies **candidate research gaps** by analyzing patterns 
-    across multiple papers. These are not proven gaps — they are directions 
-    worth investigating.
-    """)
-    
-    resp = requests.get(f"{API_URL}/papers")
-    if resp.status_code == 200:
-        papers = resp.json()["papers"]
-        extracted_papers = [p for p in papers if p["extracted"]]
-        
-        if len(extracted_papers) < 2:
-            st.info("Need at least 2 extracted papers for gap detection.")
-        else:
-            selected_ids = st.multiselect(
-                "Select papers for gap analysis",
-                options=[p["paper_id"] for p in extracted_papers],
-                format_func=lambda pid: next(
-                    (p.get("title", p["filename"]) for p in extracted_papers if p["paper_id"] == pid),
-                    pid,
-                ),
-                default=[p["paper_id"] for p in extracted_papers[:5]],
-            )
-            
-            if st.button("🔍 Detect Gaps", type="primary") and len(selected_ids) >= 2:
-                with st.spinner("Analyzing for research gaps..."):
-                    resp = requests.post(f"{API_URL}/gaps", json=selected_ids)
-                    
-                    if resp.status_code == 200:
-                        result = resp.json()
-                        
-                        st.success(f"Analyzed {result['num_papers_analyzed']} papers")
-                        st.caption(result.get("methodology_notes", ""))
-                        
-                        gaps = result.get("gaps", [])
-                        
-                        if not gaps:
-                            st.info("No significant gaps detected.")
-                        else:
-                            st.subheader(f"🎯 {len(gaps)} Candidate Research Gaps")
-                            
-                            for i, gap in enumerate(gaps, 1):
-                                confidence_color = {
-                                    "high": "🟢",
-                                    "medium": "🟡",
-                                    "low": "🔴",
-                                }.get(gap.get("confidence", "medium"), "⚪")
-                                
-                                with st.expander(
-                                    f"{confidence_color} **Gap {i}: {gap['description'][:80]}...**"
-                                ):
-                                    col1, col2 = st.columns([2, 1])
-                                    
-                                    with col1:
-                                        st.markdown(f"**Description:** {gap['description']}")
-                                        st.markdown(f"**Type:** {gap['gap_type']}")
-                                        st.markdown(f"**Confidence:** {gap['confidence']}")
-                                        st.markdown(f"**Suggested Direction:** {gap['suggested_direction']}")
-                                    
-                                    with col2:
-                                        st.markdown(f"**Supporting Papers:** {gap['frequency']}")
-                                        st.markdown(f"**Related Limitations:** {', '.join(gap.get('related_limitations', []))}")
-                                    
-                                    if gap.get("evidence"):
-                                        st.markdown("**Supporting Evidence:**")
-                                        for ev in gap["evidence"]:
-                                            st.markdown(
-                                                f'<div class="evidence-box">'
-                                                f'"{ev["text"][:300]}"'
-                                                f'<br><small>Page {ev.get("page_number", "?")}</small>'
-                                                f'</div>',
-                                                unsafe_allow_html=True,
-                                            )
-
-
-# ============ PAGE: EVIDENCE VIEWER ============
-elif page == "🔎 Evidence Viewer":
-    st.header("Evidence Viewer")
-    st.markdown("Search for evidence across all papers.")
-    
-    query = st.text_input("Enter your query", placeholder="e.g., small dataset limitation")
-    paper_id = st.text_input("Paper ID (optional)", placeholder="Leave empty to search all papers")
-    top_k = st.slider("Number of results", 1, 20, 5)
-    
-    if query:
-        with st.spinner("Searching..."):
-            params = {"query": query, "top_k": top_k}
-            if paper_id:
-                params["paper_id"] = paper_id
-            
-            resp = requests.get(f"{API_URL}/evidence", params=params)
-            
-            if resp.status_code == 200:
-                evidence = resp.json()["evidence"]
-                
-                if not evidence:
-                    st.info("No evidence found for this query.")
+            st.caption(f"{len(selected_ids)} paper(s) selected. Select at least 2 to compare.")
+            if st.button(
+                "Analyze selected papers",
+                type="primary",
+                disabled=len(selected_ids) < 2,
+                use_container_width=True,
+            ):
+                with st.spinner("Comparing extracted information..."):
+                    result, error = api_json("POST", "/compare", json_body=selected_ids)
+                if error:
+                    st.error(error)
                 else:
-                    st.subheader(f"Found {len(evidence)} evidence snippets")
-                    
-                    for i, ev in enumerate(evidence, 1):
-                        st.markdown(f"**{i}. {ev.get('paper_title', ev.get('paper_id', 'Unknown'))}**")
-                        st.caption(f"Section: {ev.get('section', 'N/A')} | Page {ev.get('page', '?')} | Relevance: {ev.get('relevance_score', 0):.2f}")
-                        st.markdown(f'<div class="evidence-box">"{ev["text"]}"</div>', unsafe_allow_html=True)
-                        st.divider()
+                    st.session_state["last_comparison_result"] = result
+                    st.session_state["last_comparison_ids"] = selected_ids
+
+            result = st.session_state.get("last_comparison_result")
+            if result and st.session_state.get("last_comparison_ids") == selected_ids:
+                comparison = result.get("comparison", {})
+                trends = result.get("trends", {}) or {}
+                common_methods = comparison.get("common_methods", {}) or {}
+                common_datasets = comparison.get("common_datasets", {}) or {}
+                common_lims = comparison.get("common_limitations", {}) or {}
+
+                summary_cols = st.columns(3)
+                summary_cols[0].metric("Methods shared across papers", len(common_methods))
+                summary_cols[1].metric("Datasets shared across papers", len(common_datasets))
+                summary_cols[2].metric("Limitation categories", len(common_lims))
+
+                left, right = st.columns(2)
+                with left:
+                    st.markdown("### Common methods")
+                    if common_methods:
+                        for method, paper_ids in sorted(common_methods.items(), key=lambda x: -len(x[1])):
+                            st.write(f"**{method}** · {len(paper_ids)} paper(s)")
+                    else:
+                        st.info("No common methods found.")
+                    st.markdown("### Common datasets")
+                    if common_datasets:
+                        for dataset, paper_ids in sorted(common_datasets.items(), key=lambda x: -len(x[1])):
+                            st.write(f"**{dataset}** · {len(paper_ids)} paper(s)")
+                    else:
+                        st.info("No common datasets found.")
+                with right:
+                    st.markdown("### Common limitations")
+                    if common_lims:
+                        for lim_type, paper_ids in sorted(common_lims.items(), key=lambda x: -len(x[1])):
+                            st.write(f"**{str(lim_type).replace('_', ' ').title()}** · {len(paper_ids)} paper(s)")
+                    else:
+                        st.info("No common limitations found.")
+                    st.markdown("### Emerging methods")
+                    emerging = trends.get("emerging_methods", []) or []
+                    if emerging:
+                        for method in emerging[:5]:
+                            st.write(f"**{method.get('value', 'Unknown')}** · {method.get('frequency', 0):.0%}")
+                    else:
+                        st.caption("No emerging-method trend was returned.")
+
+                method_freq = trends.get("method_frequency", {}) or {}
+                dataset_freq = trends.get("dataset_frequency", {}) or {}
+                if method_freq or dataset_freq:
+                    st.markdown("### Frequency overview")
+                    try:
+                        import pandas as pd
+                        import plotly.express as px
+
+                        chart_left, chart_right = st.columns(2)
+                        with chart_left:
+                            if method_freq:
+                                df = pd.DataFrame(
+                                    sorted(method_freq.items(), key=lambda x: -x[1])[:10],
+                                    columns=["Method", "Count"],
+                                )
+                                fig = px.bar(df, x="Count", y="Method", orientation="h", title="Most frequent methods")
+                                fig.update_layout(yaxis={"categoryorder": "total ascending"}, margin=dict(l=10, r=10, t=50, b=10))
+                                st.plotly_chart(fig, use_container_width=True)
+                        with chart_right:
+                            if dataset_freq:
+                                df = pd.DataFrame(
+                                    sorted(dataset_freq.items(), key=lambda x: -x[1])[:10],
+                                    columns=["Dataset", "Count"],
+                                )
+                                fig = px.bar(df, x="Count", y="Dataset", orientation="h", title="Most frequent datasets")
+                                fig.update_layout(yaxis={"categoryorder": "total ascending"}, margin=dict(l=10, r=10, t=50, b=10))
+                                st.plotly_chart(fig, use_container_width=True)
+                    except ImportError:
+                        st.info("Install pandas and plotly to display charts; textual analysis is still available.")
+                with st.expander("View raw API response"):
+                    st.json(result)
+
+
+# ---------- Research Gaps ----------
+elif page == "🔍 Research Gaps":
+    render_page_header(
+        "WORKSPACE / OPPORTUNITIES",
+        "Candidate research gaps",
+        "Identify recurring limitations and potential directions across papers. These are hypotheses to investigate, not proven gaps.",
+    )
+    papers, error = fetch_papers()
+    if error:
+        st.error(error)
+    else:
+        extracted_papers = [p for p in papers if p.get("extracted")]
+        if len(extracted_papers) < 2:
+            render_empty_state(
+                "More papers needed",
+                "Extract at least two papers before running gap analysis.",
+            )
+        else:
+            selected_ids = st.multiselect(
+                "Papers for gap analysis",
+                options=[p["paper_id"] for p in extracted_papers],
+                format_func=lambda pid: next(
+                    (paper_label(p) for p in extracted_papers if p.get("paper_id") == pid),
+                    str(pid),
+                ),
+                default=[p["paper_id"] for p in extracted_papers[:5]],
+                key="gaps_selected_ids",
+            )
+            st.caption(f"{len(selected_ids)} paper(s) selected.")
+            if st.button(
+                "Detect candidate gaps",
+                type="primary",
+                disabled=len(selected_ids) < 2,
+                use_container_width=True,
+            ):
+                with st.spinner("Analyzing recurring limitations and evidence..."):
+                    result, error = api_json("POST", "/gaps", json_body=selected_ids)
+                if error:
+                    st.error(error)
+                else:
+                    st.session_state["last_gaps_result"] = result
+                    st.session_state["last_gaps_ids"] = selected_ids
+
+            result = st.session_state.get("last_gaps_result")
+            if result and st.session_state.get("last_gaps_ids") == selected_ids:
+                analyzed = result.get("num_papers_analyzed", len(selected_ids))
+                st.success(f"Analysis completed for {analyzed} paper(s).")
+                notes = result.get("methodology_notes")
+                if notes:
+                    st.info(notes)
+                gaps = result.get("gaps", []) or []
+                if not gaps:
+                    st.info("No significant candidate gaps were returned.")
+                else:
+                    st.markdown(f"### {len(gaps)} candidate direction(s)")
+                    for index, gap in enumerate(gaps, start=1):
+                        confidence = str(gap.get("confidence", "unknown")).lower()
+                        icon = {"high": "🟢", "medium": "🟡", "low": "🔴"}.get(confidence, "⚪")
+                        description = gap.get("description", "Undescribed gap")
+                        with st.expander(f"{icon} {index}. {description[:100]}", expanded=index == 1):
+                            detail_col, meta_col = st.columns([2, 1])
+                            with detail_col:
+                                st.markdown("**Description**")
+                                st.write(description)
+                                st.markdown("**Suggested direction**")
+                                st.write(gap.get("suggested_direction", "Not provided"))
+                            with meta_col:
+                                st.markdown("**Gap type**")
+                                st.write(gap.get("gap_type", "Not specified"))
+                                st.markdown("**Confidence**")
+                                st.write(gap.get("confidence", "Not specified"))
+                                st.markdown("**Supporting papers**")
+                                st.write(gap.get("frequency", "Not specified"))
+                            related = gap.get("related_limitations", []) or []
+                            if related:
+                                st.markdown("**Related limitations**")
+                                st.write(", ".join(map(str, related)))
+                            evidence = gap.get("evidence", []) or []
+                            if evidence:
+                                st.markdown("**Supporting evidence**")
+                                for ev in evidence:
+                                    with st.container(border=True):
+                                        show_evidence(ev)
+                with st.expander("View raw API response"):
+                    st.json(result)
+
+
+# ---------- Evidence Viewer ----------
+elif page == "🔎 Evidence Viewer":
+    render_page_header(
+        "WORKSPACE / EVIDENCE",
+        "Evidence explorer",
+        "Search source passages across the paper library and inspect their page, section and relevance metadata.",
+    )
+    with st.form("evidence_search_form"):
+        query = st.text_input(
+            "Search query",
+            placeholder="e.g. small dataset limitation",
+            help="Search for a concept, method, dataset or limitation mentioned in the papers.",
+        )
+        paper_id = st.text_input(
+            "Limit to a paper ID (optional)",
+            placeholder="Leave blank to search all papers",
+        )
+        top_k = st.slider("Maximum results", min_value=1, max_value=20, value=5)
+        submitted = st.form_submit_button("Search evidence", type="primary", use_container_width=True)
+
+    if submitted:
+        if not query.strip():
+            st.warning("Enter a search query first.")
+        else:
+            params = {"query": query.strip(), "top_k": top_k}
+            if paper_id.strip():
+                params["paper_id"] = paper_id.strip()
+            with st.spinner("Searching the paper library..."):
+                result, error = api_json("GET", "/evidence", params=params)
+            if error:
+                st.error(error)
+            else:
+                evidence = result.get("evidence", []) if isinstance(result, dict) else []
+                st.session_state["last_evidence_result"] = evidence
+                st.session_state["last_evidence_query"] = query.strip()
+
+    evidence = st.session_state.get("last_evidence_result")
+    previous_query = st.session_state.get("last_evidence_query")
+    if evidence is not None:
+        st.markdown(f"### {len(evidence)} result(s) for “{previous_query}”")
+        if not evidence:
+            st.info("No evidence found for this query.")
+        else:
+            for index, item in enumerate(evidence, start=1):
+                title = item.get("paper_title") or item.get("paper_id") or "Unknown paper"
+                with st.container(border=True):
+                    st.markdown(f"**{index}. {title}**")
+                    page = item.get("page", item.get("page_number", "?"))
+                    section = item.get("section", "N/A")
+                    score = item.get("relevance_score")
+                    meta = [f"Section: {section}", f"Page {page}"]
+                    if score is not None:
+                        try:
+                            meta.append(f"Relevance: {float(score):.2f}")
+                        except (TypeError, ValueError):
+                            meta.append(f"Relevance: {score}")
+                    st.caption(" · ".join(meta))
+                    st.write(item.get("text", "No evidence text returned."))
+
+# ---------- Footer ----------
+st.divider()
+st.caption("SciInsight · Scientific Literature Intelligence · Existing backend response formats preserved.")
